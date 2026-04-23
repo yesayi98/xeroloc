@@ -1,0 +1,27 @@
+### Environment
+/.env.local
+/.env.*.local
+
+### Dependencies
+/vendor/
+
+### Symfony generated files
+/config/reference.php
+/var/
+!/var/.gitkeep
+
+### Local databases
+/*.sqlite
+/*.sqlite3
+/*.db
+
+### IDE/editor
+/.idea/
+/.vscode/
+
+### Local agent files
+/.codex
+
+### OS files
+.DS_Store
+Thumbs.db

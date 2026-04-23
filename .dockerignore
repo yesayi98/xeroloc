@@ -1,0 +1,7 @@
+.git
+.idea
+.codex
+vendor
+var/cache
+var/log
+var/data

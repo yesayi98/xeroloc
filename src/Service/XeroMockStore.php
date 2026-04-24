@@ -28,28 +28,42 @@ final class XeroMockStore
         return $_ENV['XERO_MOCK_TENANT_ID'] ?? $_SERVER['XERO_MOCK_TENANT_ID'] ?? 'mock-tenant-0001';
     }
 
+    public function defaultClientId(): string
+    {
+        return 'mock-client-id';
+    }
+
     public function requestId(): string
     {
         return bin2hex(random_bytes(16));
     }
 
     /**
-     * @return array{access_token: string, refresh_token: string}
+     * @return array{access_token: string, refresh_token: string, scope: string}
      */
-    public function createToken(string $grantType, string $scope): array
+    public function createToken(
+        string $grantType,
+        string $scope,
+        ?string $userId = null,
+        ?string $userEmail = null,
+        ?string $clientId = null,
+    ): array
     {
         $accessToken = 'mock_access_'.bin2hex(random_bytes(24));
         $refreshToken = 'mock_refresh_'.bin2hex(random_bytes(24));
 
         $statement = $this->pdo->prepare(
-            'INSERT INTO tokens (access_token, refresh_token, grant_type, scope, expires_at, created_at, revoked_at)
-             VALUES (:access_token, :refresh_token, :grant_type, :scope, :expires_at, :created_at, :revoked_at)'
+            'INSERT INTO tokens (access_token, refresh_token, grant_type, scope, client_id, user_id, user_email, expires_at, created_at, revoked_at)
+             VALUES (:access_token, :refresh_token, :grant_type, :scope, :client_id, :user_id, :user_email, :expires_at, :created_at, :revoked_at)'
         );
         $statement->execute([
             'access_token' => $accessToken,
             'refresh_token' => $refreshToken,
             'grant_type' => $grantType,
             'scope' => $scope,
+            'client_id' => $clientId,
+            'user_id' => $userId,
+            'user_email' => $userEmail ?? '',
             'expires_at' => gmdate('c', time() + 1800),
             'created_at' => gmdate('c'),
             'revoked_at' => null,
@@ -58,6 +72,7 @@ final class XeroMockStore
         return [
             'access_token' => $accessToken,
             'refresh_token' => $refreshToken,
+            'scope' => $scope,
         ];
     }
 
@@ -67,30 +82,47 @@ final class XeroMockStore
     public function tokens(): array
     {
         $rows = $this->pdo->query('SELECT * FROM tokens ORDER BY created_at DESC')->fetchAll(PDO::FETCH_ASSOC);
-        $now = time();
 
-        return array_map(function (array $row) use ($now): array {
-            $revokedAt = isset($row['revoked_at']) && $row['revoked_at'] !== '' ? (string) $row['revoked_at'] : null;
-            $expiresAt = strtotime((string) $row['expires_at']);
-            $status = 'ACTIVE';
+        return $this->mapTokenRows($rows);
+    }
 
-            if ($revokedAt !== null) {
-                $status = 'REVOKED';
-            } elseif ($expiresAt !== false && $expiresAt < $now) {
-                $status = 'EXPIRED';
-            }
+    /**
+     * @return array{
+     *     items: list<array<string, mixed>>,
+     *     page: int,
+     *     per_page: int,
+     *     total: int,
+     *     total_pages: int
+     * }
+     */
+    public function tokensPage(int $page, int $perPage): array
+    {
+        $perPage = max(1, min($perPage, 100));
+        $total = (int) $this->pdo->query('SELECT COUNT(*) FROM tokens')->fetchColumn();
+        $totalPages = max(1, (int) ceil($total / $perPage));
+        $page = max(1, min($page, $totalPages));
+        $offset = ($page - 1) * $perPage;
 
-            return [
-                'access_token' => (string) $row['access_token'],
-                'refresh_token' => (string) $row['refresh_token'],
-                'grant_type' => (string) $row['grant_type'],
-                'scope' => (string) $row['scope'],
-                'expires_at' => (string) $row['expires_at'],
-                'created_at' => (string) $row['created_at'],
-                'revoked_at' => $revokedAt,
-                'status' => $status,
-            ];
-        }, $rows);
+        $statement = $this->pdo->prepare(
+            'SELECT *
+             FROM tokens
+             ORDER BY created_at DESC
+             LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue('limit', $perPage, PDO::PARAM_INT);
+        $statement->bindValue('offset', $offset, PDO::PARAM_INT);
+        $statement->execute();
+
+        /** @var list<array<string, mixed>> $rows */
+        $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
+
+        return [
+            'items' => $this->mapTokenRows($rows),
+            'page' => $page,
+            'per_page' => $perPage,
+            'total' => $total,
+            'total_pages' => $totalPages,
+        ];
     }
 
     public function revokeToken(string $token): bool
@@ -107,6 +139,336 @@ final class XeroMockStore
         ]);
 
         return $statement->rowCount() > 0;
+    }
+
+    /**
+     * @return array{access_token: string, refresh_token: string, scope: string}|null
+     */
+    public function refreshToken(string $refreshToken, ?string $scope = null): ?array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT client_id, user_id, user_email, scope
+             FROM tokens
+             WHERE refresh_token = :refresh_token
+               AND revoked_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1'
+        );
+        $statement->execute(['refresh_token' => $refreshToken]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+
+        if (!is_array($row)) {
+            return null;
+        }
+
+        return $this->createToken(
+            grantType: 'refresh_token',
+            scope: $scope ?? (string) $row['scope'],
+            userId: $row['user_id'] !== '' ? (string) $row['user_id'] : null,
+            userEmail: $row['user_email'] !== '' ? (string) $row['user_email'] : null,
+            clientId: $row['client_id'] !== '' ? (string) $row['client_id'] : null,
+        );
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function createClient(
+        string $name,
+        string $redirectUri,
+        ?string $clientId = null,
+        ?string $clientSecret = null,
+        string $description = '',
+        string $homepageUrl = '',
+    ): array {
+        $normalizedName = trim($name);
+        $normalizedRedirectUri = trim($redirectUri);
+        $normalizedClientId = trim((string) $clientId);
+        $normalizedClientSecret = trim((string) $clientSecret);
+        $normalizedDescription = trim($description);
+        $normalizedHomepageUrl = trim($homepageUrl);
+
+        if ($normalizedClientId === '') {
+            $normalizedClientId = 'mock-client-'.bin2hex(random_bytes(8));
+        }
+
+        if ($normalizedClientSecret === '') {
+            $normalizedClientSecret = 'mock-secret-'.bin2hex(random_bytes(24));
+        }
+
+        $existing = $this->findClientRowById($normalizedClientId);
+        $now = gmdate('c');
+
+        if ($existing === null) {
+            $statement = $this->pdo->prepare(
+                'INSERT INTO oauth_clients (
+                    client_id,
+                    client_secret,
+                    name,
+                    redirect_uri,
+                    description,
+                    homepage_url,
+                    created_at,
+                    updated_at
+                 ) VALUES (
+                    :client_id,
+                    :client_secret,
+                    :name,
+                    :redirect_uri,
+                    :description,
+                    :homepage_url,
+                    :created_at,
+                    :updated_at
+                 )'
+            );
+            $statement->execute([
+                'client_id' => $normalizedClientId,
+                'client_secret' => $normalizedClientSecret,
+                'name' => $normalizedName,
+                'redirect_uri' => $normalizedRedirectUri,
+                'description' => $normalizedDescription,
+                'homepage_url' => $normalizedHomepageUrl,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        } else {
+            $statement = $this->pdo->prepare(
+                'UPDATE oauth_clients
+                 SET client_secret = :client_secret,
+                     name = :name,
+                     redirect_uri = :redirect_uri,
+                     description = :description,
+                     homepage_url = :homepage_url,
+                     updated_at = :updated_at
+                 WHERE client_id = :client_id'
+            );
+            $statement->execute([
+                'client_id' => $normalizedClientId,
+                'client_secret' => $normalizedClientSecret,
+                'name' => $normalizedName,
+                'redirect_uri' => $normalizedRedirectUri,
+                'description' => $normalizedDescription,
+                'homepage_url' => $normalizedHomepageUrl,
+                'updated_at' => $now,
+            ]);
+        }
+
+        return $this->findClientById($normalizedClientId) ?? [
+            'ClientID' => $normalizedClientId,
+            'ClientSecret' => $normalizedClientSecret,
+            'Name' => $normalizedName,
+            'RedirectURI' => $normalizedRedirectUri,
+            'Description' => $normalizedDescription,
+            'HomepageURL' => $normalizedHomepageUrl,
+            'CreatedAt' => $now,
+            'UpdatedAt' => $now,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function findClientById(string $clientId): ?array
+    {
+        $row = $this->findClientRowById(trim($clientId));
+
+        return $row !== null ? $this->clientResponse($row) : null;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    public function clients(): array
+    {
+        $rows = $this->pdo
+            ->query('SELECT * FROM oauth_clients ORDER BY created_at DESC, name ASC')
+            ->fetchAll(PDO::FETCH_ASSOC);
+
+        return array_map(fn (array $row): array => $this->clientResponse($row), $rows);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function createMockUser(
+        string $email,
+        string $password,
+        string $firstName = 'Mock',
+        string $lastName = 'User',
+    ): array {
+        $normalizedEmail = strtolower(trim($email));
+        $existing = $this->findUserRowByEmail($normalizedEmail);
+        $now = gmdate('c');
+
+        if ($existing === null) {
+            $statement = $this->pdo->prepare(
+                'INSERT INTO users (user_id, email, password_hash, first_name, last_name, created_at, updated_at)
+                 VALUES (:user_id, :email, :password_hash, :first_name, :last_name, :created_at, :updated_at)'
+            );
+            $statement->execute([
+                'user_id' => $this->uuid(),
+                'email' => $normalizedEmail,
+                'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        } else {
+            $statement = $this->pdo->prepare(
+                'UPDATE users
+                 SET password_hash = :password_hash,
+                     first_name = :first_name,
+                     last_name = :last_name,
+                     updated_at = :updated_at
+                 WHERE email = :email'
+            );
+            $statement->execute([
+                'email' => $normalizedEmail,
+                'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+                'updated_at' => $now,
+            ]);
+        }
+
+        return $this->findUserByEmail($normalizedEmail) ?? [
+            'UserID' => '',
+            'Email' => $normalizedEmail,
+            'FirstName' => $firstName,
+            'LastName' => $lastName,
+            'CreatedAt' => $now,
+            'UpdatedAt' => $now,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function verifyMockUserCredentials(string $email, string $password): ?array
+    {
+        $row = $this->findUserRowByEmail(strtolower(trim($email)));
+        if ($row === null || !password_verify($password, (string) $row['password_hash'])) {
+            return null;
+        }
+
+        return $this->mockUserResponse($row);
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function findUserByEmail(string $email): ?array
+    {
+        $row = $this->findUserRowByEmail(strtolower(trim($email)));
+
+        return $row !== null ? $this->mockUserResponse($row) : null;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    public function mockUsers(): array
+    {
+        $rows = $this->pdo->query('SELECT * FROM users ORDER BY email')->fetchAll(PDO::FETCH_ASSOC);
+
+        return array_map(fn (array $row): array => $this->mockUserResponse($row), $rows);
+    }
+
+    public function createAuthorizationCode(
+        string $userId,
+        string $userEmail,
+        string $clientId,
+        string $redirectUri,
+        string $scope,
+    ): string {
+        $code = 'mock_auth_code_'.bin2hex(random_bytes(16));
+
+        $statement = $this->pdo->prepare(
+            'INSERT INTO authorization_codes (
+                code,
+                user_id,
+                user_email,
+                client_id,
+                redirect_uri,
+                scope,
+                expires_at,
+                created_at,
+                consumed_at
+             ) VALUES (
+                :code,
+                :user_id,
+                :user_email,
+                :client_id,
+                :redirect_uri,
+                :scope,
+                :expires_at,
+                :created_at,
+                :consumed_at
+             )'
+        );
+        $statement->execute([
+            'code' => $code,
+            'user_id' => $userId,
+            'user_email' => $userEmail,
+            'client_id' => $clientId,
+            'redirect_uri' => $redirectUri,
+            'scope' => $scope,
+            'expires_at' => gmdate('c', time() + 300),
+            'created_at' => gmdate('c'),
+            'consumed_at' => null,
+        ]);
+
+        return $code;
+    }
+
+    /**
+     * @return array{user_id: string, user_email: string, scope: string}|null
+     */
+    public function consumeAuthorizationCode(string $code, string $clientId, string $redirectUri): ?array
+    {
+        if ($code === '') {
+            return null;
+        }
+
+        $statement = $this->pdo->prepare(
+            'SELECT *
+             FROM authorization_codes
+             WHERE code = :code
+             LIMIT 1'
+        );
+        $statement->execute(['code' => $code]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+
+        if (!is_array($row)) {
+            return null;
+        }
+
+        $expiresAt = strtotime((string) $row['expires_at']);
+        if (
+            $row['consumed_at'] !== null
+            || ($expiresAt !== false && $expiresAt < time())
+            || (string) $row['client_id'] !== $clientId
+            || (string) $row['redirect_uri'] !== $redirectUri
+        ) {
+            return null;
+        }
+
+        $update = $this->pdo->prepare(
+            'UPDATE authorization_codes
+             SET consumed_at = :consumed_at
+             WHERE code = :code'
+        );
+        $update->execute([
+            'consumed_at' => gmdate('c'),
+            'code' => $code,
+        ]);
+
+        return [
+            'user_id' => (string) $row['user_id'],
+            'user_email' => (string) $row['user_email'],
+            'scope' => (string) $row['scope'],
+        ];
     }
 
     /**
@@ -422,12 +784,62 @@ final class XeroMockStore
                 refresh_token TEXT NOT NULL,
                 grant_type TEXT NOT NULL,
                 scope TEXT NOT NULL,
+                client_id TEXT DEFAULT NULL,
+                user_id TEXT DEFAULT NULL,
+                user_email TEXT NOT NULL DEFAULT "",
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 revoked_at TEXT DEFAULT NULL
             )'
         );
         $this->ensureColumnExists('tokens', 'revoked_at', 'TEXT DEFAULT NULL');
+        $this->ensureColumnExists('tokens', 'client_id', 'TEXT DEFAULT NULL');
+        $this->ensureColumnExists('tokens', 'user_id', 'TEXT DEFAULT NULL');
+        $this->ensureColumnExists('tokens', 'user_email', 'TEXT NOT NULL DEFAULT ""');
+
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS oauth_clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL UNIQUE,
+                client_secret TEXT NOT NULL,
+                name TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT "",
+                homepage_url TEXT NOT NULL DEFAULT "",
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )'
+        );
+        $this->ensureColumnExists('oauth_clients', 'description', 'TEXT NOT NULL DEFAULT ""');
+        $this->ensureColumnExists('oauth_clients', 'homepage_url', 'TEXT NOT NULL DEFAULT ""');
+
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )'
+        );
+
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS authorization_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consumed_at TEXT DEFAULT NULL
+            )'
+        );
 
         $this->pdo->exec(
             'CREATE TABLE IF NOT EXISTS contacts (
@@ -489,24 +901,44 @@ final class XeroMockStore
 
     private function seed(): void
     {
-        $count = (int) $this->pdo->query('SELECT COUNT(*) FROM contacts')->fetchColumn();
-        if ($count > 0) {
-            return;
+        $clientCount = (int) $this->pdo->query('SELECT COUNT(*) FROM oauth_clients')->fetchColumn();
+        if ($clientCount === 0) {
+            $this->createClient(
+                name: 'Default Demo App',
+                redirectUri: 'http://localhost:3000/callback',
+                clientId: $this->defaultClientId(),
+                clientSecret: 'mock-client-secret',
+                description: 'Default OAuth client used by local examples and manual testing.',
+                homepageUrl: 'http://localhost:3000',
+            );
         }
 
-        $this->createContact([
-            'ContactID' => '00000000-0000-4000-8000-000000000001',
-            'Name' => 'Acme Supplies',
-            'EmailAddress' => 'billing@acme.test',
-            'ContactStatus' => 'ACTIVE',
-        ]);
-        $this->createInvoice([
-            'InvoiceID' => '00000000-0000-4000-8000-000000000101',
-            'InvoiceNumber' => 'INV-0001',
-            'Contact' => ['Name' => 'Acme Supplies'],
-            'Status' => 'AUTHORISED',
-            'Total' => 125.50,
-        ]);
+        $userCount = (int) $this->pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
+        if ($userCount === 0) {
+            $this->createMockUser('alice@example.test', 'alice-pass', 'Alice', 'Mock');
+            $this->createMockUser('bob@example.test', 'bob-pass', 'Bob', 'Mock');
+        }
+
+        $contactCount = (int) $this->pdo->query('SELECT COUNT(*) FROM contacts')->fetchColumn();
+        if ($contactCount === 0) {
+            $this->createContact([
+                'ContactID' => '00000000-0000-4000-8000-000000000001',
+                'Name' => 'Acme Supplies',
+                'EmailAddress' => 'billing@acme.test',
+                'ContactStatus' => 'ACTIVE',
+            ]);
+        }
+
+        $invoiceCount = (int) $this->pdo->query('SELECT COUNT(*) FROM invoices')->fetchColumn();
+        if ($invoiceCount === 0) {
+            $this->createInvoice([
+                'InvoiceID' => '00000000-0000-4000-8000-000000000101',
+                'InvoiceNumber' => 'INV-0001',
+                'Contact' => ['Name' => 'Acme Supplies'],
+                'Status' => 'AUTHORISED',
+                'Total' => 125.50,
+            ]);
+        }
     }
 
     /**
@@ -582,6 +1014,110 @@ final class XeroMockStore
             'LineAmountTypes' => $row['line_amount_types'],
             'Total' => (float) $row['total'],
             'UpdatedDateUTC' => $row['updated_at'],
+        ];
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function mapTokenRows(array $rows): array
+    {
+        $now = time();
+
+        return array_map(function (array $row) use ($now): array {
+            $revokedAt = isset($row['revoked_at']) && $row['revoked_at'] !== '' ? (string) $row['revoked_at'] : null;
+            $expiresAt = strtotime((string) $row['expires_at']);
+            $status = 'ACTIVE';
+
+            if ($revokedAt !== null) {
+                $status = 'REVOKED';
+            } elseif ($expiresAt !== false && $expiresAt < $now) {
+                $status = 'EXPIRED';
+            }
+
+            return [
+                'access_token' => (string) $row['access_token'],
+                'refresh_token' => (string) $row['refresh_token'],
+                'grant_type' => (string) $row['grant_type'],
+                'scope' => (string) $row['scope'],
+                'client_id' => isset($row['client_id']) && $row['client_id'] !== '' ? (string) $row['client_id'] : null,
+                'expires_at' => (string) $row['expires_at'],
+                'created_at' => (string) $row['created_at'],
+                'revoked_at' => $revokedAt,
+                'user_id' => isset($row['user_id']) && $row['user_id'] !== '' ? (string) $row['user_id'] : null,
+                'user_email' => isset($row['user_email']) && $row['user_email'] !== '' ? (string) $row['user_email'] : null,
+                'status' => $status,
+            ];
+        }, $rows);
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function findClientRowById(string $clientId): ?array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT *
+             FROM oauth_clients
+             WHERE client_id = :client_id
+             LIMIT 1'
+        );
+        $statement->execute(['client_id' => $clientId]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+
+        return is_array($row) ? $row : null;
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function findUserRowByEmail(string $email): ?array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT *
+             FROM users
+             WHERE email = :email
+             LIMIT 1'
+        );
+        $statement->execute(['email' => $email]);
+        $row = $statement->fetch(PDO::FETCH_ASSOC);
+
+        return is_array($row) ? $row : null;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     *
+     * @return array<string, mixed>
+     */
+    private function mockUserResponse(array $row): array
+    {
+        return [
+            'UserID' => $row['user_id'],
+            'Email' => $row['email'],
+            'FirstName' => $row['first_name'],
+            'LastName' => $row['last_name'],
+            'CreatedAt' => $row['created_at'],
+            'UpdatedAt' => $row['updated_at'],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     *
+     * @return array<string, mixed>
+     */
+    private function clientResponse(array $row): array
+    {
+        return [
+            'ClientID' => $row['client_id'],
+            'ClientSecret' => $row['client_secret'],
+            'Name' => $row['name'],
+            'RedirectURI' => $row['redirect_uri'],
+            'Description' => $row['description'],
+            'HomepageURL' => $row['homepage_url'],
+            'CreatedAt' => $row['created_at'],
+            'UpdatedAt' => $row['updated_at'],
         ];
     }
 

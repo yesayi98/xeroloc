@@ -15,4 +15,5 @@ services:
       XERO_MOCK_TENANT_ID: "${XERO_MOCK_TENANT_ID:-mock-tenant-0001}"
     volumes:
       - .:/app
+      - ./identifier.sqlite:/app/var/data/xero_mock.sqlite
     command: sh -lc "mkdir -p var/data var/cache /tmp/composer && composer install --no-interaction && php -S 0.0.0.0:8000 -t public public/index.php"

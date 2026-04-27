@@ -66,6 +66,9 @@ docker compose exec -T app php bin/console app:mock-user:add jane@example.test s
 
 OAuth clients are also stored in SQLite.
 
+The registered `redirect_uri` may be either a concrete URL like `https://app.test/callback`
+or a scheme-flexible pattern like `http(s?)://app.test/callback`.
+
 Default seeded client:
 
 ```text

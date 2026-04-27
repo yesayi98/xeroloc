@@ -53,7 +53,23 @@ final readonly class XeroAuthController
         }
 
         $registeredRedirectUri = trim((string) $client['RedirectURI']);
-        if ($registeredRedirectUri !== '' && $redirectUri !== $registeredRedirectUri) {
+        if ($registeredRedirectUri !== '' && !$this->store->isValidRedirectUri($registeredRedirectUri)) {
+            return new Response($this->renderAuthorizePage(
+                clientId: $clientId,
+                client: $client,
+                redirectUri: $registeredRedirectUri,
+                state: $state,
+                scope: $scope,
+                email: $email !== '' ? $email : $loginHint,
+                error: 'Registered redirect_uri is malformed. Update this OAuth client in /admin before using the flow.',
+            ), Response::HTTP_BAD_REQUEST);
+        }
+
+        if ($redirectUri === '') {
+            $redirectUri = $this->store->concreteRedirectUri($registeredRedirectUri);
+        }
+
+        if ($registeredRedirectUri !== '' && !$this->store->redirectUriMatches($registeredRedirectUri, $redirectUri)) {
             return new Response($this->renderAuthorizePage(
                 clientId: $clientId,
                 client: $client,
@@ -62,6 +78,19 @@ final readonly class XeroAuthController
                 scope: $scope,
                 email: $email !== '' ? $email : $loginHint,
                 error: 'redirect_uri does not match the registered client redirect URI.',
+            ), Response::HTTP_BAD_REQUEST);
+        }
+
+        $redirectUri = $this->store->concreteRedirectUri($redirectUri);
+        if ($redirectUri !== '' && !$this->store->isValidRedirectUri($redirectUri)) {
+            return new Response($this->renderAuthorizePage(
+                clientId: $clientId,
+                client: $client,
+                redirectUri: $redirectUri,
+                state: $state,
+                scope: $scope,
+                email: $email !== '' ? $email : $loginHint,
+                error: 'redirect_uri is malformed. Expected a valid http:// or https:// callback URL.',
             ), Response::HTTP_BAD_REQUEST);
         }
 
@@ -149,10 +178,22 @@ final readonly class XeroAuthController
         }
 
         if ($grantType === 'authorization_code') {
+            $redirectUri = trim((string) $payload->get('redirect_uri', ''));
+            if ($redirectUri === '') {
+                $redirectUri = $this->store->concreteRedirectUri((string) $client['RedirectURI']);
+            }
+
+            if (!$this->store->isValidRedirectUri($redirectUri)) {
+                return new JsonResponse([
+                    'error' => 'invalid_request',
+                    'error_description' => 'redirect_uri is malformed.',
+                ], Response::HTTP_BAD_REQUEST);
+            }
+
             $authorization = $this->store->consumeAuthorizationCode(
                 code: trim((string) $payload->get('code', '')),
                 clientId: $clientId,
-                redirectUri: trim((string) $payload->get('redirect_uri', '')),
+                redirectUri: $redirectUri,
             );
             if ($authorization === null) {
                 return $this->invalidGrant('Invalid, expired or already-consumed authorization code.');

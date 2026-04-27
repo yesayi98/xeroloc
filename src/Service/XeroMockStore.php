@@ -33,6 +33,63 @@ final class XeroMockStore
         return 'mock-client-id';
     }
 
+    public function concreteRedirectUri(string $redirectUri, string $preferredScheme = 'http'): string
+    {
+        $normalized = trim($redirectUri);
+        if ($normalized === '') {
+            return '';
+        }
+
+        if (str_starts_with($normalized, 'http(s?)://')) {
+            return $preferredScheme.'://'.substr($normalized, strlen('http(s?)://'));
+        }
+
+        return $normalized;
+    }
+
+    public function redirectUriMatches(string $registeredRedirectUri, string $candidateRedirectUri): bool
+    {
+        $registered = trim($registeredRedirectUri);
+        $candidate = trim($candidateRedirectUri);
+
+        if ($registered === '' || $candidate === '') {
+            return $registered === $candidate;
+        }
+
+        if ($registered === $candidate) {
+            return true;
+        }
+
+        foreach ([[$registered, $candidate], [$candidate, $registered]] as [$pattern, $value]) {
+            if (!str_starts_with($pattern, 'http(s?)://')) {
+                continue;
+            }
+
+            $suffix = substr($pattern, strlen('http(s?)://'));
+            $regex = '#^https?://'.preg_quote($suffix, '#').'$#';
+            if (preg_match($regex, $value) === 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function isValidRedirectUri(string $redirectUri): bool
+    {
+        $normalized = trim($redirectUri);
+        if ($normalized === '' || preg_match('/\s/', $normalized) === 1) {
+            return false;
+        }
+
+        if (str_starts_with($normalized, 'http(s?)://')) {
+            return $this->isValidConcreteHttpUrl($this->concreteRedirectUri($normalized, 'http'))
+                && $this->isValidConcreteHttpUrl($this->concreteRedirectUri($normalized, 'https'));
+        }
+
+        return $this->isValidConcreteHttpUrl($normalized);
+    }
+
     public function requestId(): string
     {
         return bin2hex(random_bytes(16));
@@ -449,7 +506,7 @@ final class XeroMockStore
             $row['consumed_at'] !== null
             || ($expiresAt !== false && $expiresAt < time())
             || (string) $row['client_id'] !== $clientId
-            || (string) $row['redirect_uri'] !== $redirectUri
+            || !$this->redirectUriMatches((string) $row['redirect_uri'], $redirectUri)
         ) {
             return null;
         }
@@ -1175,6 +1232,44 @@ final class XeroMockStore
         }
 
         $this->pdo->exec(sprintf('ALTER TABLE %s ADD COLUMN %s %s', $table, $column, $definition));
+    }
+
+    private function isValidConcreteHttpUrl(string $url): bool
+    {
+        $parts = parse_url($url);
+        if (!is_array($parts)) {
+            return false;
+        }
+
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        if (!in_array($scheme, ['http', 'https'], true)) {
+            return false;
+        }
+
+        $host = (string) ($parts['host'] ?? '');
+        if ($host === '') {
+            return false;
+        }
+
+        if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
+            $ipv6Host = substr($host, 1, -1);
+            if (filter_var($ipv6Host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) === false) {
+                return false;
+            }
+        } elseif (str_contains($host, ':')) {
+            return false;
+        } elseif (!preg_match('/^[A-Za-z0-9.-]+$/', $host)) {
+            return false;
+        }
+
+        if (isset($parts['port'])) {
+            $port = (int) $parts['port'];
+            if ($port < 1 || $port > 65535) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private function uuid(): string

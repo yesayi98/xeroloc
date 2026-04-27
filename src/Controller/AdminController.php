@@ -73,6 +73,14 @@ final readonly class AdminController
             );
         }
 
+        if (!$this->store->isValidRedirectUri($redirectUri)) {
+            return $this->redirectToDashboard(
+                notice: 'Redirect URI must be a valid http:// or https:// URL. A scheme-flexible pattern like http(s?)://app.test/callback is also allowed.',
+                level: 'warning',
+                params: ['token_page' => $this->submittedTokenPage($request)],
+            );
+        }
+
         $client = $this->store->createClient(
             name: $name,
             redirectUri: $redirectUri,
@@ -210,7 +218,7 @@ final readonly class AdminController
         $defaultClientId = $this->store->defaultClientId();
         $defaultClient = $this->store->findClientById($defaultClientId);
         $defaultClientRedirectUri = is_array($defaultClient)
-            ? (string) ($defaultClient['RedirectURI'] ?? 'http://localhost:3000/callback')
+            ? $this->store->concreteRedirectUri((string) ($defaultClient['RedirectURI'] ?? 'http://localhost:3000/callback'))
             : 'http://localhost:3000/callback';
         $defaultAuthorizeUrl = $this->escape('/identity/connect/authorize?'.http_build_query([
             'response_type' => 'code',
@@ -1089,7 +1097,8 @@ HTML;
         $rows = [];
         foreach ($clients as $client) {
             $clientId = (string) ($client['ClientID'] ?? '');
-            $redirectUri = (string) ($client['RedirectURI'] ?? '');
+            $registeredRedirectUri = (string) ($client['RedirectURI'] ?? '');
+            $redirectUri = $this->store->concreteRedirectUri($registeredRedirectUri);
             $authorizeUrl = $baseUrl.'/identity/connect/authorize?'.http_build_query([
                 'response_type' => 'code',
                 'client_id' => $clientId,
@@ -1115,7 +1124,7 @@ HTML;
                 $descriptionMarkup,
                 $this->escape($clientId),
                 $this->escape((string) ($client['ClientSecret'] ?? '')),
-                $this->escape($redirectUri),
+                $this->escape($registeredRedirectUri),
                 $this->escape($authorizeUrl),
                 $this->escape((string) ($client['UpdatedAt'] ?? '')),
             );
